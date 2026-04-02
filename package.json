@@ -1,0 +1,16 @@
+{
+  "name": "nelnet-scraper",
+  "version": "1.0.0",
+  "description": "Scrape Nelnet student loan balance",
+  "type": "module",
+  "scripts": {
+    "start": "node scraper.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "imapflow": "^1.2.18",
+    "mailparser": "^3.9.6",
+    "playwright": "^1.44.0"
+  }
+}
