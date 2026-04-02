@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 import { config } from 'dotenv';
 import { existsSync, mkdirSync } from 'fs';
 import { waitForEmailCode } from './mfa-email.js';
+import { pushLoanGroupsToGoogleSheet } from './sheets-push.js';
 
 config();
 
@@ -29,6 +30,43 @@ async function screenshot(page, name) {
 }
 
 /**
+ * Federal usage disclaimer (`data-cy="accept-disclaimer"`, submit) — required before My Loans / nav.
+ * Uses attached + force (not only visible); main frame + iframes; avoids navigation wait on submit.
+ */
+async function acceptFederalDisclaimer(surface) {
+  const tryClickOnSurface = async (s) => {
+    const locators = [
+      s.locator('[data-cy="accept-disclaimer"]'),
+      s.locator('#accept-disclaimer'),
+      s.locator('button[type="submit"]#accept-disclaimer'),
+      s.getByRole('button', { name: /accept federal usage disclaimer/i }),
+    ];
+    for (const loc of locators) {
+      const n = await loc.count().catch(() => 0);
+      if (n === 0) continue;
+      const el = loc.first();
+      const connected = await el.evaluate((node) => node && node.isConnected).catch(() => false);
+      if (!connected) continue;
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click(CLICK_NO_NAV).catch(() => {});
+      console.log('Accepted federal usage disclaimer.');
+      await surface.waitForTimeout(450);
+      return true;
+    }
+    return false;
+  };
+
+  for (let pass = 0; pass < 22; pass++) {
+    const surfaces = [surface, ...surface.frames().filter((f) => f !== surface.mainFrame())];
+    for (const s of surfaces) {
+      if (await tryClickOnSurface(s)) return true;
+    }
+    await surface.waitForTimeout(320);
+  }
+  return false;
+}
+
+/**
  * Cookie banner sits above the federal disclaimer; clear cookie first, then disclaimer.
  */
 async function dismissBlockingOverlays(page) {
@@ -50,20 +88,7 @@ async function dismissBlockingOverlays(page) {
       console.log('Clicked cookie Accept all (text).');
     }
 
-    if (await disclaimer.isVisible().catch(() => false)) {
-      await disclaimer.scrollIntoViewIfNeeded().catch(() => {});
-      await disclaimer.click({ force: true }).catch(() => {});
-      console.log('Clicked federal disclaimer Accept.');
-    } else if (await disclaimerByAria.isVisible().catch(() => false)) {
-      await disclaimerByAria.click({ force: true }).catch(() => {});
-      console.log('Clicked federal disclaimer (aria).');
-    } else {
-      const acceptOnly = page.getByRole('button', { name: /^accept$/i });
-      if ((await acceptOnly.count()) > 0 && (await acceptOnly.first().isVisible().catch(() => false))) {
-        await acceptOnly.first().click({ force: true }).catch(() => {});
-        console.log('Clicked plain Accept.');
-      }
-    }
+    await acceptFederalDisclaimer(page);
 
     await page.waitForTimeout(350);
 
@@ -72,7 +97,8 @@ async function dismissBlockingOverlays(page) {
       (await cookieHeading.isVisible().catch(() => false));
     const discStill =
       (await disclaimer.isVisible().catch(() => false)) ||
-      (await disclaimerByAria.isVisible().catch(() => false));
+      (await disclaimerByAria.isVisible().catch(() => false)) ||
+      (await page.locator('[data-cy="accept-disclaimer"], #accept-disclaimer').count()) > 0;
 
     if (!cookieStill && !discStill && pass >= 2) break;
   }
@@ -141,6 +167,9 @@ async function fillCredentials(surface, username, password) {
   }
 }
 
+/** Clicks that start OAuth/SPA transitions or submit disclaimers — avoid waiting for navigation to finish. */
+const CLICK_NO_NAV = { force: true, noWaitAfter: true };
+
 /** FSA / OIDC often label the first step "Continue" instead of Sign in. */
 async function clickLoginSubmit(surface) {
   const trySurface = async (s) => {
@@ -148,14 +177,14 @@ async function clickLoginSubmit(surface) {
       .getByRole('button', { name: /sign in|log in|submit|continue|next|verify/i })
       .first();
     if (await primary.isVisible().catch(() => false)) {
-      await primary.click({ force: true });
+      await primary.click(CLICK_NO_NAV);
       // Do not call textContent() after click — navigation can detach the node and hang 30s.
       console.log('Clicked login submit control');
       return true;
     }
     const submitEl = s.locator('input[type="submit"], button[type="submit"]').first();
     if (await submitEl.isVisible().catch(() => false)) {
-      await submitEl.click({ force: true });
+      await submitEl.click(CLICK_NO_NAV);
       console.log('Clicked submit control (type=submit).');
       return true;
     }
@@ -172,7 +201,7 @@ async function clickLoginSubmit(surface) {
   const tryFallback = async (s) => {
     const fb = s.getByRole('button', { name: /continue|sign in|log in|submit|next|verify/i }).first();
     if (await fb.isVisible().catch(() => false)) {
-      await fb.click({ force: true });
+      await fb.click(CLICK_NO_NAV);
       console.log('Clicked login (fallback button).');
       return true;
     }
@@ -241,7 +270,7 @@ async function pickEmailMfaOption(s, surface) {
   const tryClick = async (loc, label) => {
     if (!(await loc.isVisible().catch(() => false))) return false;
     await loc.scrollIntoViewIfNeeded().catch(() => {});
-    await loc.click({ force: true });
+    await loc.click(CLICK_NO_NAV);
     console.log(`MFA: ${label}`);
     await surface.waitForTimeout(450);
     return true;
@@ -254,7 +283,7 @@ async function pickEmailMfaOption(s, surface) {
     const attached = await el.evaluate((node) => node.isConnected).catch(() => false);
     if (!attached) return false;
     await el.scrollIntoViewIfNeeded().catch(() => {});
-    await el.click({ force: true });
+    await el.click(CLICK_NO_NAV);
     console.log(`MFA: ${label}`);
     await surface.waitForTimeout(450);
     return true;
@@ -339,7 +368,7 @@ async function clickSendMfaCodeButton(s, surface) {
   for (const loc of candidates) {
     if (await loc.isVisible().catch(() => false)) {
       await loc.scrollIntoViewIfNeeded().catch(() => {});
-      await loc.click({ force: true });
+      await loc.click(CLICK_NO_NAV);
       console.log('MFA: clicked Send Code.');
       await surface.waitForTimeout(900);
       return true;
@@ -389,7 +418,7 @@ async function prepareEmailMfaFlow(surface) {
         .getByRole('button', { name: /email.*code|code.*email|send.*to.*email|verify.*email/i })
         .first();
       if (await oneStep.isVisible().catch(() => false)) {
-        await oneStep.click({ force: true });
+        await oneStep.click(CLICK_NO_NAV);
         console.log('MFA: clicked combined email/send control.');
         await surface.waitForTimeout(1200);
         return true;
@@ -424,11 +453,15 @@ async function openMainNavIfNeeded(surface) {
  * Go to My Loans: optional MY_LOANS_URL, direct paths on current origin, then dashboard + nav + click.
  */
 async function navigateToMyLoans(surface) {
+  await acceptFederalDisclaimer(surface);
+  await surface.waitForTimeout(400);
+
   const tryGoto = async (url) => {
     try {
       const resp = await surface.goto(url, { waitUntil: 'load', timeout: 45_000 });
       if (resp?.status() && resp.status() >= 400) return false;
       await surface.waitForTimeout(800);
+      await acceptFederalDisclaimer(surface);
       console.log('Opened URL:', url);
       return true;
     } catch {
@@ -452,11 +485,13 @@ async function navigateToMyLoans(surface) {
   }
 
   await tryGoto(`${origin}/dashboard`);
+  await acceptFederalDisclaimer(surface);
 
   await openMainNavIfNeeded(surface);
   await surface.waitForTimeout(500);
 
   const tryClickStrategies = async (s) => {
+    await acceptFederalDisclaimer(surface);
     const nameLoose = /my\s*loans/i;
     const candidates = [
       s.getByRole('link', { name: nameLoose }).first(),
@@ -474,7 +509,7 @@ async function navigateToMyLoans(surface) {
     for (const loc of candidates) {
       if (await loc.isVisible().catch(() => false)) {
         await loc.scrollIntoViewIfNeeded().catch(() => {});
-        await loc.click({ force: true });
+        await loc.click({ force: true, noWaitAfter: true });
         console.log('Clicked My Loans (UI).');
         await s.waitForTimeout(1200);
         return true;
@@ -503,6 +538,7 @@ async function navigateToMyLoans(surface) {
 
     if (clicked) {
       console.log('Clicked My Loans (DOM text match).');
+      await acceptFederalDisclaimer(surface);
       await s.waitForTimeout(1200);
       return true;
     }
@@ -547,6 +583,8 @@ async function scrapeLoanGroupsFromPage(page) {
           flat.match(/principal[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
           '';
         let unpaid =
+          flat.match(/unpaid\s*accrued[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          flat.match(/accrued\s*interest[:\s]*(\$[\d,]+\.\d{2})/i)?.[1] ||
           flat.match(/unpaid\s*interest[:\s]*(\$[\d,]+\.\d{2})/i)?.[1] ||
           flat.match(/unpaid[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
           '';
@@ -560,7 +598,7 @@ async function scrapeLoanGroupsFromPage(page) {
         };
       };
 
-      /** Nelnet u-grid cells: interest-rate-value, principal-balance-value, (unpaid TBD). */
+      /** Nelnet u-grid: per-group cells use group-* data-cy for unpaid accrued interest. */
       const readDataCyFromFragment = (frag) => {
         if (!frag) return { interestRate: '', principalBalance: '', unpaidInterest: '' };
         const pick = (...sels) => {
@@ -578,9 +616,11 @@ async function scrapeLoanGroupsFromPage(page) {
             '[data-cy="current-principal-value"]',
           ),
           unpaidInterest: pick(
+            '[data-cy="group-unpaid-accrued-interest-value"]',
             '[data-cy="unpaid-interest-value"]',
             '[data-cy="unpaid-interest"]',
             '[data-cy="outstanding-interest-value"]',
+            '[data-cy="accrued-interest-value"]',
           ),
         };
       };
@@ -725,6 +765,68 @@ async function scrapeLoanGroupsFromPage(page) {
   });
 }
 
+/** Parse "$39,036.30" / "39,036.30" to a number (USD). */
+function parseCurrencyToNumber(text) {
+  if (text == null || typeof text !== 'string') return NaN;
+  const m = String(text)
+    .replace(/,/g, '')
+    .match(/-?\$?\s*([\d.]+)/);
+  if (!m) return NaN;
+  const n = parseFloat(m[1]);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/** Total owed ≈ sum of principal + unpaid interest per loan group (matches Nelnet “current balance”). */
+function sumLoanGroupTotalsUsd(loanGroups) {
+  let sum = 0;
+  for (const r of loanGroups) {
+    const p = parseCurrencyToNumber(r.principalBalance);
+    const u = parseCurrencyToNumber(r.unpaidInterest);
+    sum += (Number.isFinite(p) ? p : 0) + (Number.isFinite(u) ? u : 0);
+  }
+  return sum;
+}
+
+async function scrapeCurrentBalanceText(surface) {
+  await surface
+    .locator('[data-cy="current-balance-value"]')
+    .first()
+    .waitFor({ state: 'attached', timeout: 15_000 })
+    .catch(() => {});
+
+  const read = (loc) =>
+    loc.evaluate(() => {
+      const el = document.querySelector('[data-cy="current-balance-value"]');
+      return el ? (el.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    });
+  let t = await read(surface);
+  if (!t) {
+    for (const fr of surface.frames()) {
+      if (fr === surface.mainFrame()) continue;
+      t = await read(fr).catch(() => '');
+      if (t) break;
+    }
+  }
+  return t;
+}
+
+/**
+ * Compare scraped group totals to the page’s current balance (authoritative).
+ * @returns {{ ok: boolean, currentText: string, current: number, sum: number, diff: number }}
+ */
+async function validateLoanTotalsAgainstCurrentBalance(surface, loanGroups) {
+  const currentText = await scrapeCurrentBalanceText(surface);
+  const current = parseCurrencyToNumber(currentText);
+  const sum = sumLoanGroupTotalsUsd(loanGroups);
+  const diff = Math.abs(sum - current);
+  const tolerance = 1.02;
+  const ok =
+    Number.isFinite(current) &&
+    Number.isFinite(sum) &&
+    diff <= tolerance;
+  return { ok, currentText, current, sum, diff };
+}
+
 async function scrapeNelnet() {
   const browser = await chromium.launch({ headless: false, slowMo: 500 });
   const page = await browser.newPage();
@@ -765,7 +867,21 @@ async function scrapeNelnet() {
 
     console.log('Submitting login...');
     await clickLoginSubmit(activePage);
-    await activePage.waitForLoadState('load', { timeout: 60_000 });
+    // OAuth/Angular often updates the shell without a classic document load — wait for MFA or next paint.
+    await Promise.race([
+      activePage.waitForLoadState('load', { timeout: 60_000 }),
+      activePage
+        .getByText(
+          /receive your authentication code|how do you want|verification|one-time|security code|two.factor|mfa/i,
+        )
+        .first()
+        .waitFor({ state: 'visible', timeout: 45_000 }),
+      activePage.locator('input[autocomplete="one-time-code"], input[inputmode="numeric"]').first().waitFor({
+        state: 'visible',
+        timeout: 45_000,
+      }),
+    ]).catch(() => {});
+    await activePage.waitForTimeout(600);
     await screenshot(activePage, '04-post-login');
 
     // Email / MFA OTP step (may show method picker + Send code before the input appears)
@@ -827,6 +943,7 @@ async function scrapeNelnet() {
     console.log('Opening My Loans...');
     await activePage.waitForLoadState('load').catch(() => {});
     await activePage.waitForTimeout(1500);
+    await acceptFederalDisclaimer(activePage);
     await screenshot(activePage, '06-dashboard');
 
     const onMyLoans = await navigateToMyLoans(activePage);
@@ -840,12 +957,17 @@ async function scrapeNelnet() {
     await screenshot(activePage, '07-my-loans');
 
     await activePage.getByText(/Group:\s*\S+/i).first().waitFor({ state: 'attached', timeout: 25_000 }).catch(() => {});
-    for (let s = 0; s < 10; s++) {
-      await activePage.evaluate(() => window.scrollBy(0, 700));
-      await activePage.waitForTimeout(200);
-    }
-    await activePage.evaluate(() => window.scrollTo(0, 0));
-    await activePage.waitForTimeout(400);
+
+    const scrollMyLoansForVirtualization = async () => {
+      for (let s = 0; s < 10; s++) {
+        await activePage.evaluate(() => window.scrollBy(0, 700));
+        await activePage.waitForTimeout(200);
+      }
+      await activePage.evaluate(() => window.scrollTo(0, 0));
+      await activePage.waitForTimeout(400);
+    };
+
+    await scrollMyLoansForVirtualization();
 
     let loanGroups = await scrapeLoanGroupsFromPage(activePage);
     if (!loanGroups.length) {
@@ -853,6 +975,40 @@ async function scrapeNelnet() {
         if (fr === activePage.mainFrame()) continue;
         loanGroups = await scrapeLoanGroupsFromPage(fr);
         if (loanGroups.length) break;
+      }
+    }
+
+    if (loanGroups.length) {
+      let check = await validateLoanTotalsAgainstCurrentBalance(activePage, loanGroups);
+      if (!check.ok && Number.isFinite(check.current)) {
+        console.warn(
+          `Balance check: Σ(principal+unpaid) $${check.sum.toFixed(2)} vs current balance $${check.current.toFixed(2)} (diff $${check.diff.toFixed(2)}). Re-scrolling and re-scraping once…`,
+        );
+        await scrollMyLoansForVirtualization();
+        loanGroups = await scrapeLoanGroupsFromPage(activePage);
+        if (!loanGroups.length) {
+          for (const fr of activePage.frames()) {
+            if (fr === activePage.mainFrame()) continue;
+            loanGroups = await scrapeLoanGroupsFromPage(fr);
+            if (loanGroups.length) break;
+          }
+        }
+        check = await validateLoanTotalsAgainstCurrentBalance(activePage, loanGroups);
+      }
+      if (Number.isFinite(check.current)) {
+        if (check.ok) {
+          console.log(
+            `Balance check OK: Σ(principal+unpaid) $${check.sum.toFixed(2)} ≈ current balance $${check.current.toFixed(2)}.`,
+          );
+        } else {
+          console.warn(
+            `Balance check still off: Σ $${check.sum.toFixed(2)} vs [data-cy=current-balance-value] $${check.current.toFixed(2)} (diff $${check.diff.toFixed(2)}). Compare row amounts to the page.`,
+          );
+        }
+      } else if (check.currentText) {
+        console.warn('Could not parse current balance from:', check.currentText);
+      } else {
+        console.warn('No [data-cy="current-balance-value"] found; skipped total-vs-page check.');
       }
     }
 
@@ -874,6 +1030,8 @@ async function scrapeNelnet() {
         );
       }
       console.log('\nJSON:\n' + JSON.stringify(loanGroups, null, 2));
+
+      await pushLoanGroupsToGoogleSheet(loanGroups);
     }
 
   } catch (err) {

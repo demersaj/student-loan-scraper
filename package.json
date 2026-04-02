@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "googleapis": "^144.0.0",
     "imapflow": "^1.2.18",
     "mailparser": "^3.9.6",
     "playwright": "^1.44.0"
