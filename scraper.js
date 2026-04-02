@@ -526,6 +526,150 @@ async function navigateToMyLoans(surface) {
 async function scrapeLoanGroupsFromPage(page) {
   return page.evaluate(() => {
     /** @returns {{ group: string, interestRate: string, principalBalance: string, unpaidInterest: string }[]} */
+
+    /** Nelnet My Loans: "<strong>Group: AC</strong>" repeated (~17 loan groups). */
+    const scrapeFromGroupStrong = () => {
+      const groupHeadings = [...document.querySelectorAll('strong, b')].filter((s) =>
+        /^Group:\s*\S+/i.test((s.textContent || '').trim()),
+      );
+      if (!groupHeadings.length) return [];
+
+      const cleanEl = (el) => (el?.textContent || '').replace(/\s+/g, ' ').trim();
+
+      const parseBlob = (text) => {
+        const flat = (text || '').replace(/\s+/g, ' ').trim();
+        const rate =
+          flat.match(/interest\s*rate[:\s]*([\d.]+\s*%)/i)?.[1]?.trim() ||
+          flat.match(/([\d.]+\s*%)/)?.[1]?.trim() ||
+          '';
+        let principal =
+          flat.match(/principal\s*balance[:\s]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          flat.match(/principal[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          '';
+        let unpaid =
+          flat.match(/unpaid\s*interest[:\s]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          flat.match(/unpaid[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          '';
+        const monies = [...flat.matchAll(/\$[\d,]+\.\d{2}/g)].map((x) => x[0]);
+        if (!principal && monies[0]) principal = monies[0];
+        if (!unpaid && monies[1]) unpaid = monies[1];
+        return {
+          interestRate: rate,
+          principalBalance: principal,
+          unpaidInterest: unpaid,
+        };
+      };
+
+      /** Nelnet u-grid cells: interest-rate-value, principal-balance-value, (unpaid TBD). */
+      const readDataCyFromFragment = (frag) => {
+        if (!frag) return { interestRate: '', principalBalance: '', unpaidInterest: '' };
+        const pick = (...sels) => {
+          for (const sel of sels) {
+            const el = frag.querySelector(sel);
+            if (el) return cleanEl(el);
+          }
+          return '';
+        };
+        return {
+          interestRate: pick('[data-cy="interest-rate-value"]'),
+          principalBalance: pick(
+            '[data-cy="principal-balance-value"]',
+            '[data-cy="principal-balance"]',
+            '[data-cy="current-principal-value"]',
+          ),
+          unpaidInterest: pick(
+            '[data-cy="unpaid-interest-value"]',
+            '[data-cy="unpaid-interest"]',
+            '[data-cy="outstanding-interest-value"]',
+          ),
+        };
+      };
+
+      /** Last loan group: smallest wrapper that has Nelnet rate cell but no other Group: heading. */
+      const fragmentForLastGroup = (strong) => {
+        let el = strong.parentElement;
+        for (let d = 0; d < 25 && el; d++) {
+          if (!el.querySelector('[data-cy="interest-rate-value"]')) {
+            el = el.parentElement;
+            continue;
+          }
+          const otherHeadings = [...el.querySelectorAll('strong, b')].filter(
+            (s) =>
+              s !== strong && /^Group:\s*\S+/i.test((s.textContent || '').trim()),
+          );
+          if (otherHeadings.length === 0) {
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            try {
+              range.setStartAfter(strong);
+            } catch {
+              /* strong not inside el */
+            }
+            const div = document.createElement('div');
+            div.appendChild(range.cloneContents());
+            return div;
+          }
+          el = el.parentElement;
+        }
+        return null;
+      };
+
+      const rows = [];
+      for (let i = 0; i < groupHeadings.length; i++) {
+        const strong = groupHeadings[i];
+        const next = groupHeadings[i + 1];
+        const m = (strong.textContent || '').trim().match(/^Group:\s*(.+)$/i);
+        const group = m ? m[1].trim() : '';
+        if (!group) continue;
+
+        let frag = null;
+        let blob = '';
+        try {
+          if (next) {
+            const range = document.createRange();
+            range.setStartAfter(strong);
+            range.setEndBefore(next);
+            frag = document.createElement('div');
+            frag.appendChild(range.cloneContents());
+            blob = frag.innerText || '';
+          } else {
+            frag = fragmentForLastGroup(strong);
+            blob = frag ? frag.innerText : '';
+            if (!blob) {
+              let c = strong.parentElement;
+              const label = (strong.textContent || '').trim();
+              for (let d = 0; d < 20 && c; d++) {
+                const t = c.innerText || '';
+                if (/\$[\d,]+\.\d{2}/.test(t)) {
+                  const idx = t.indexOf(label);
+                  blob = idx >= 0 ? t.slice(idx + label.length) : t;
+                  break;
+                }
+                c = c.parentElement;
+              }
+              if (!blob) blob = (strong.parentElement && strong.parentElement.innerText) || '';
+            }
+          }
+        } catch {
+          blob = '';
+          frag = null;
+        }
+
+        const fromCy = readDataCyFromFragment(frag);
+        const p = parseBlob(blob);
+        rows.push({
+          group,
+          interestRate: fromCy.interestRate || p.interestRate,
+          principalBalance: fromCy.principalBalance || p.principalBalance,
+          unpaidInterest: fromCy.unpaidInterest || p.unpaidInterest,
+        });
+      }
+      return rows;
+    };
+
+    const fromNg = scrapeFromGroupStrong();
+    if (fromNg.length) return fromNg;
+
     const out = [];
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
@@ -695,6 +839,14 @@ async function scrapeNelnet() {
     await activePage.waitForTimeout(2500);
     await screenshot(activePage, '07-my-loans');
 
+    await activePage.getByText(/Group:\s*\S+/i).first().waitFor({ state: 'attached', timeout: 25_000 }).catch(() => {});
+    for (let s = 0; s < 10; s++) {
+      await activePage.evaluate(() => window.scrollBy(0, 700));
+      await activePage.waitForTimeout(200);
+    }
+    await activePage.evaluate(() => window.scrollTo(0, 0));
+    await activePage.waitForTimeout(400);
+
     let loanGroups = await scrapeLoanGroupsFromPage(activePage);
     if (!loanGroups.length) {
       for (const fr of activePage.frames()) {
@@ -710,6 +862,11 @@ async function scrapeNelnet() {
       amounts.forEach((a) => console.log(' ', a.trim()));
       console.log('Inspect screenshots/07-my-loans.png and we can tighten selectors.');
     } else {
+      if (loanGroups.length !== 17) {
+        console.warn(
+          `Parsed ${loanGroups.length} loan group(s). If you expect 17, scroll the My Loans page manually once and compare — some UIs virtualize lists.`,
+        );
+      }
       console.log('\n--- Loan groups ---');
       for (const row of loanGroups) {
         console.log(
