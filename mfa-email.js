@@ -21,6 +21,22 @@ function extractOtpFromText(text) {
 }
 
 /**
+ * Nelnet / NelnetNoReply template: <p class="h2 text-gray text-center ...">807166</p>
+ */
+function extractNelnetOtpFromHtml(html) {
+  if (!html || typeof html !== 'string') return null;
+  const patterns = [
+    /<p[^>]*\bh2\b[^>]*\btext-gray\b[^>]*>\s*(\d{6,8})\s*<\/p>/i,
+    /<p[^>]*\btext-gray\b[^>]*\bh2\b[^>]*>\s*(\d{6,8})\s*<\/p>/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
  * Poll IMAP for a recent message and extract an OTP. Use an app-specific password,
  * not your main account password (Gmail: Google Account → Security → App passwords).
  *
@@ -96,10 +112,12 @@ export async function waitForEmailCode(opts) {
         if (subjectContains && !subject.toLowerCase().includes(subjectContains.toLowerCase())) continue;
 
         const parsed = await simpleParser(msg.source);
-        const combined = [parsed.text, parsed.html ? String(parsed.html).replace(/<[^>]+>/g, ' ') : '', subject].join(
-          '\n',
-        );
-        const code = extractOtpFromText(combined);
+        const htmlStr = parsed.html ? String(parsed.html) : '';
+        let code = extractNelnetOtpFromHtml(htmlStr);
+        if (!code) {
+          const combined = [parsed.text, htmlStr.replace(/<[^>]+>/g, ' '), subject].join('\n');
+          code = extractOtpFromText(combined);
+        }
         if (code && code.length >= 6) {
           await client.logout();
           return code;
@@ -124,4 +142,4 @@ export async function waitForEmailCode(opts) {
     : new Error('Timed out waiting for a verification code in email');
 }
 
-export { extractOtpFromText };
+export { extractOtpFromText, extractNelnetOtpFromHtml };

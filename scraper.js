@@ -149,7 +149,8 @@ async function clickLoginSubmit(surface) {
       .first();
     if (await primary.isVisible().catch(() => false)) {
       await primary.click({ force: true });
-      console.log('Clicked login submit:', (await primary.textContent())?.trim());
+      // Do not call textContent() after click — navigation can detach the node and hang 30s.
+      console.log('Clicked login submit control');
       return true;
     }
     const submitEl = s.locator('input[type="submit"], button[type="submit"]').first();
@@ -168,9 +169,25 @@ async function clickLoginSubmit(surface) {
     if (await trySurface(frame)) return;
   }
 
-  const fallback = surface.getByRole('button', { name: /continue|sign in|next/i }).first();
-  await fallback.waitFor({ state: 'visible', timeout: 15_000 });
-  await fallback.click({ force: true });
+  const tryFallback = async (s) => {
+    const fb = s.getByRole('button', { name: /continue|sign in|log in|submit|next|verify/i }).first();
+    if (await fb.isVisible().catch(() => false)) {
+      await fb.click({ force: true });
+      console.log('Clicked login (fallback button).');
+      return true;
+    }
+    return false;
+  };
+
+  if (await tryFallback(surface)) return;
+  for (const frame of surface.frames()) {
+    if (frame === surface.mainFrame()) continue;
+    if (await tryFallback(frame)) return;
+  }
+
+  throw new Error(
+    'No login submit button found (sign in / continue / verify). Check screenshots and update selectors.',
+  );
 }
 
 function otpLocator(surface) {
@@ -210,71 +227,177 @@ async function fillOtpAndSubmit(surface, code) {
 }
 
 /**
+ * Nelnet: "How Do You Want to Receive Your Authentication Code?" — Text vs
+ * "Email code to a***@…" radios + green "Send Code". Material radios often need
+ * mat-radio or label clicks, not only getByRole('radio').
+ */
+async function pickEmailMfaOption(s, surface) {
+  await s
+    .getByText(/receive your authentication code|authentication code\?/i)
+    .first()
+    .waitFor({ state: 'visible', timeout: 12_000 })
+    .catch(() => {});
+
+  const tryClick = async (loc, label) => {
+    if (!(await loc.isVisible().catch(() => false))) return false;
+    await loc.scrollIntoViewIfNeeded().catch(() => {});
+    await loc.click({ force: true });
+    console.log(`MFA: ${label}`);
+    await surface.waitForTimeout(450);
+    return true;
+  };
+
+  /** Nelnet `u-radio__input` is often not “visible” to Playwright but still clickable. */
+  const tryForceClickIfPresent = async (loc, label) => {
+    if ((await loc.count()) === 0) return false;
+    const el = loc.first();
+    const attached = await el.evaluate((node) => node.isConnected).catch(() => false);
+    if (!attached) return false;
+    await el.scrollIntoViewIfNeeded().catch(() => {});
+    await el.click({ force: true });
+    console.log(`MFA: ${label}`);
+    await surface.waitForTimeout(450);
+    return true;
+  };
+
+  // Prefer the visible label (u-radio); works when the real <input> is hidden. Try even in iframes
+  // where the heading text may live on the parent — id=for is unique on this step.
+  if (await tryClick(s.locator('label[for="mfa-option-1"]').first(), 'selected Email (label[for=mfa-option-1])')) {
+    return true;
+  }
+  if (
+    await tryForceClickIfPresent(
+      s.locator('input[type="radio"]#mfa-option-1'),
+      'selected Email (input#mfa-option-1)',
+    )
+  ) {
+    return true;
+  }
+
+  // Native radio — id / data-cy / name+value (may be visibility:hidden for styling).
+  if (await tryForceClickIfPresent(
+    s.locator('input[type="radio"][name="AuthChoice"][value="Email"]'),
+    'selected Email (AuthChoice=Email)',
+  )) {
+    return true;
+  }
+  if (await tryForceClickIfPresent(s.locator('input[type="radio"][data-cy="mfa-radio-1"]'), 'selected Email (data-cy mfa-radio-1)')) {
+    return true;
+  }
+
+  if (await tryClick(s.getByRole('radio', { name: /email code to|email.*@/i }).first(), 'selected Email (radio)')) {
+    return true;
+  }
+  if (await tryClick(s.getByRole('radio', { name: /email/i }).first(), 'selected Email (radio, broad)')) {
+    return true;
+  }
+
+  const matEmail = s.locator('mat-radio-button, .mat-mdc-radio-button').filter({ hasText: /email code to|email.*@/i }).first();
+  if (await tryClick(matEmail, 'selected Email (mat-radio-button)')) {
+    return true;
+  }
+
+  if (await tryClick(s.getByText(/email code to/i).first(), 'selected Email (visible text)')) {
+    return true;
+  }
+  if (await tryClick(s.locator('label').filter({ hasText: /email code to/i }).first(), 'selected Email (label)')) {
+    return true;
+  }
+
+  const authHeading = s.getByText(/receive your authentication code/i).first();
+  const onChooser = await authHeading.isVisible().catch(() => false);
+  if (onChooser) {
+    const authRadios = s.locator('input[type="radio"][name="AuthChoice"]');
+    const cnt = await authRadios.count();
+    if (cnt >= 2) {
+      if (await tryForceClickIfPresent(authRadios.nth(1), 'selected 2nd AuthChoice (Email)')) {
+        return true;
+      }
+    }
+    const radios = s.getByRole('radio');
+    if ((await radios.count()) === 2) {
+      if (await tryClick(radios.nth(1), 'selected second role=radio (Email)')) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+async function clickSendMfaCodeButton(s, surface) {
+  const candidates = [
+    s.getByRole('button', { name: /^send code$/i }).first(),
+    s.getByRole('button', { name: /send\s+code|resend(\s+code)?|send\s+verification/i }).first(),
+    s.locator('button[u-button], button.u-button--contained').filter({ hasText: /send\s+code/i }).first(),
+    s.locator('button.mat-mdc-raised-button, button.mdc-button').filter({ hasText: /send\s+code/i }).first(),
+    s.locator('button[type="submit"]').filter({ hasText: /send/i }).first(),
+    s.locator('button, a').filter({ hasText: /^send code$/i }).first(),
+    s.getByRole('link', { name: /send\s+code/i }).first(),
+  ];
+
+  for (const loc of candidates) {
+    if (await loc.isVisible().catch(() => false)) {
+      await loc.scrollIntoViewIfNeeded().catch(() => {});
+      await loc.click({ force: true });
+      console.log('MFA: clicked Send Code.');
+      await surface.waitForTimeout(900);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Federal login often asks you to pick Email vs text, then click Send code before the mail arrives.
  * Returns true if we likely clicked something on an MFA chooser / send step.
  */
 async function prepareEmailMfaFlow(surface) {
-  const sendName =
-    /send(\s+(a\s+)?code)?|resend|get\s+(the\s+)?code|email\s+(me\s+)?(a\s+)?code|request\s+.*code|send\s+verification|text\s+me|verify\s+by\s+email/i;
+  const surfaces = [surface, ...surface.frames().filter((f) => f !== surface.mainFrame())];
 
-  const trySurface = async (s) => {
-    let acted = false;
-
-    const oneStepEmail = s
-      .getByRole('button', { name: /email.*code|code.*email|send.*to.*(your\s+)?email|verify.*email/i })
-      .first();
-    if (await oneStepEmail.isVisible().catch(() => false)) {
-      await oneStepEmail.click({ force: true });
-      console.log('MFA: clicked combined email / send control.');
-      await surface.waitForTimeout(1200);
-      return true;
+  let picked = false;
+  for (const s of surfaces) {
+    if (await pickEmailMfaOption(s, surface)) {
+      picked = true;
+      break;
     }
-
-    const emailPickers = [
-      s.getByRole('radio', { name: /email/i }).first(),
-      s.getByRole('tab', { name: /email/i }).first(),
-      s.getByRole('button', { name: /^email$/i }).first(),
-      s.getByRole('menuitemradio', { name: /email/i }).first(),
-      s.locator('[role="option"]').filter({ hasText: /^email$/i }).first(),
-    ];
-
-    for (const loc of emailPickers) {
-      if (await loc.isVisible().catch(() => false)) {
-        await loc.click({ force: true });
-        console.log('MFA: selected Email as delivery method.');
-        acted = true;
-        await surface.waitForTimeout(500);
-        break;
-      }
-    }
-
-    const senders = [
-      s.getByRole('button', { name: sendName }).first(),
-      s.getByRole('link', { name: sendName }).first(),
-      s.locator('button, a').filter({ hasText: sendName }).first(),
-    ];
-
-    for (const loc of senders) {
-      if (await loc.isVisible().catch(() => false)) {
-        await loc.scrollIntoViewIfNeeded().catch(() => {});
-        await loc.click({ force: true });
-        const txt = (await loc.textContent())?.trim();
-        console.log('MFA: clicked send/request:', txt || '(control)');
-        acted = true;
-        await surface.waitForTimeout(1200);
-        break;
-      }
-    }
-
-    return acted;
-  };
-
-  if (await trySurface(surface)) return true;
-  for (const frame of surface.frames()) {
-    if (frame === surface.mainFrame()) continue;
-    if (await trySurface(frame)) return true;
   }
-  return false;
+
+  await surface.waitForTimeout(picked ? 700 : 0);
+
+  let sent = false;
+  for (const s of surfaces) {
+    if (await clickSendMfaCodeButton(s, surface)) {
+      sent = true;
+      break;
+    }
+  }
+
+  if (picked && !sent) {
+    await surface.waitForTimeout(1500);
+    for (const s of surfaces) {
+      if (await clickSendMfaCodeButton(s, surface)) {
+        sent = true;
+        break;
+      }
+    }
+  }
+
+  if (!picked && !sent) {
+    for (const s of surfaces) {
+      const oneStep = s
+        .getByRole('button', { name: /email.*code|code.*email|send.*to.*email|verify.*email/i })
+        .first();
+      if (await oneStep.isVisible().catch(() => false)) {
+        await oneStep.click({ force: true });
+        console.log('MFA: clicked combined email/send control.');
+        await surface.waitForTimeout(1200);
+        return true;
+      }
+    }
+  }
+
+  return picked || sent;
 }
 
 function imapMfaConfigured() {
@@ -331,10 +454,14 @@ async function scrapeNelnet() {
     const mfaChooser = activePage
       .getByText(/choose how|how would you like|verify it|select.*delivery|two-step|second.*factor|authentication method/i)
       .first();
+    const mfaNelnetHeading = activePage
+      .getByText(/how do you want to receive your authentication code/i)
+      .first();
     const otpGuess = otpLocator(activePage);
     const hasMfa =
       (await mfaPrompt.isVisible().catch(() => false)) ||
       (await mfaChooser.isVisible().catch(() => false)) ||
+      (await mfaNelnetHeading.isVisible().catch(() => false)) ||
       (await otpGuess.isVisible().catch(() => false));
     if (hasMfa) {
       const prepared = await prepareEmailMfaFlow(activePage);
@@ -354,7 +481,10 @@ async function scrapeNelnet() {
           password: MFA_IMAP_PASSWORD,
           mailbox: MFA_IMAP_MAILBOX,
           notBefore,
-          fromContains: MFA_EMAIL_FROM_CONTAINS || undefined,
+          // Nelnet MFA comes from NelnetNoReply / *@*nelnet* unless you set MFA_EMAIL_FROM_CONTAINS.
+          fromContains: MFA_EMAIL_FROM_CONTAINS?.trim()
+            ? MFA_EMAIL_FROM_CONTAINS
+            : 'nelnet',
           subjectContains: MFA_EMAIL_SUBJECT_CONTAINS || undefined,
         });
         console.log('Entering code from email and submitting...');
