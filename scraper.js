@@ -474,6 +474,7 @@ async function scrapeNelnet() {
       if (imapMfaConfigured()) {
         console.log('\nEmail MFA: polling inbox via IMAP...');
         await activePage.waitForTimeout(prepared ? 1000 : 2500);
+        const imapMax = Number(process.env.MFA_IMAP_MAX_WAIT_MS);
         const code = await waitForEmailCode({
           host: MFA_IMAP_HOST,
           port: MFA_IMAP_PORT,
@@ -481,6 +482,7 @@ async function scrapeNelnet() {
           password: MFA_IMAP_PASSWORD,
           mailbox: MFA_IMAP_MAILBOX,
           notBefore,
+          maxWaitMs: Number.isFinite(imapMax) && imapMax > 0 ? imapMax : undefined,
           // Nelnet MFA comes from NelnetNoReply / *@*nelnet* unless you set MFA_EMAIL_FROM_CONTAINS.
           fromContains: MFA_EMAIL_FROM_CONTAINS?.trim()
             ? MFA_EMAIL_FROM_CONTAINS
