@@ -404,6 +404,183 @@ function imapMfaConfigured() {
   return Boolean(MFA_IMAP_HOST && MFA_IMAP_USER && MFA_IMAP_PASSWORD);
 }
 
+/** Open hamburger / main nav if common controls exist (mobile or collapsed nav). */
+async function openMainNavIfNeeded(surface) {
+  const toggles = [
+    surface.getByRole('button', { name: /menu|open menu|navigation|main menu/i }).first(),
+    surface.locator('[aria-label*="menu" i],[data-cy*="menu" i]').first(),
+    surface.locator('mat-toolbar button').first(),
+  ];
+  for (const loc of toggles) {
+    if (await loc.isVisible().catch(() => false)) {
+      await loc.click({ force: true }).catch(() => {});
+      await surface.waitForTimeout(600);
+      break;
+    }
+  }
+}
+
+/**
+ * Go to My Loans: optional MY_LOANS_URL, direct paths on current origin, then dashboard + nav + click.
+ */
+async function navigateToMyLoans(surface) {
+  const tryGoto = async (url) => {
+    try {
+      const resp = await surface.goto(url, { waitUntil: 'load', timeout: 45_000 });
+      if (resp?.status() && resp.status() >= 400) return false;
+      await surface.waitForTimeout(800);
+      console.log('Opened URL:', url);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const envUrl = process.env.MY_LOANS_URL?.trim();
+  if (envUrl && (await tryGoto(envUrl))) return true;
+
+  let origin;
+  try {
+    origin = new URL(surface.url()).origin;
+  } catch {
+    origin = 'https://nelnet.studentaid.gov';
+  }
+
+  const loanPaths = ['/loans', '/my-loans', '/dashboard/loans', '/account/loans', '/loan/loan-groups', '/loan-groups'];
+  for (const p of loanPaths) {
+    if (await tryGoto(`${origin}${p}`)) return true;
+  }
+
+  await tryGoto(`${origin}/dashboard`);
+
+  await openMainNavIfNeeded(surface);
+  await surface.waitForTimeout(500);
+
+  const tryClickStrategies = async (s) => {
+    const nameLoose = /my\s*loans/i;
+    const candidates = [
+      s.getByRole('link', { name: nameLoose }).first(),
+      s.getByRole('button', { name: nameLoose }).first(),
+      s.getByRole('tab', { name: nameLoose }).first(),
+      s.getByRole('menuitem', { name: nameLoose }).first(),
+      s.getByRole('listitem').filter({ hasText: nameLoose }).first(),
+      s.locator('nav a, aside a, [class*="nav"] a').filter({ hasText: nameLoose }).first(),
+      s.locator('a, button').filter({ hasText: /^my\s*loans$/i }).first(),
+      s.locator('a, button').filter({ hasText: nameLoose }).first(),
+      s.locator('[routerlink], [ng-reflect-router-link]').filter({ hasText: nameLoose }).first(),
+      s.locator('a[href*="loan" i]').filter({ hasText: nameLoose }).first(),
+    ];
+
+    for (const loc of candidates) {
+      if (await loc.isVisible().catch(() => false)) {
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.click({ force: true });
+        console.log('Clicked My Loans (UI).');
+        await s.waitForTimeout(1200);
+        return true;
+      }
+    }
+
+    const clicked = await s
+      .evaluate(() => {
+        const labels = /my\s*loans/i;
+        const texts = (el) => (el.innerText || el.textContent || '').trim();
+        const tryClick = (el) => {
+          if (!el || typeof el.click !== 'function') return false;
+          el.click();
+          return true;
+        };
+
+        for (const el of document.querySelectorAll('a, button, [role="link"], [role="button"]')) {
+          if (labels.test(texts(el))) return tryClick(el);
+        }
+        for (const el of document.querySelectorAll('[routerlink], [ng-reflect-router-link], [tabindex="0"]')) {
+          if (labels.test(texts(el))) return tryClick(el);
+        }
+        return false;
+      })
+      .catch(() => false);
+
+    if (clicked) {
+      console.log('Clicked My Loans (DOM text match).');
+      await s.waitForTimeout(1200);
+      return true;
+    }
+
+    return false;
+  };
+
+  if (await tryClickStrategies(surface)) return true;
+
+  for (const fr of surface.frames()) {
+    if (fr === surface.mainFrame()) continue;
+    if (await tryClickStrategies(fr)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Parse loan group rows from HTML tables or Angular Material tables (best-effort DOM scrape).
+ */
+async function scrapeLoanGroupsFromPage(page) {
+  return page.evaluate(() => {
+    /** @returns {{ group: string, interestRate: string, principalBalance: string, unpaidInterest: string }[]} */
+    const out = [];
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+    const mapColumns = (headerCells) => {
+      const h = headerCells.map((x) => x.toLowerCase());
+      const idx = (pred) => h.findIndex(pred);
+      return {
+        group: idx((t) => /group|account name|loan name|subsidiary|^loan$/i.test(t) && !/rate|balance|interest paid/i.test(t)),
+        rate: idx((t) => /interest.*rate|^rate$|apr|fixed/i.test(t)),
+        principal: idx((t) => /principal.*balance|principal$/i.test(t)),
+        unpaid: idx((t) => /unpaid.*interest|outstanding.*interest|accrued/i.test(t)),
+      };
+    };
+
+    const consumeTable = (headerRow, bodyRows) => {
+      const headerCells = [...headerRow.querySelectorAll('th, td, mat-header-cell')].map((c) => clean(c.textContent));
+      if (headerCells.length < 2) return;
+      if (!headerCells.some((cell) => /principal|interest|unpaid|group|balance|rate/i.test(cell))) return;
+
+      const col = mapColumns(headerCells);
+      for (const tr of bodyRows) {
+        const cells = [...tr.querySelectorAll('td, th, mat-cell')].map((c) => clean(c.textContent));
+        if (cells.length < 2) continue;
+        const groupText = col.group >= 0 ? cells[col.group] : cells[0];
+        if (!groupText || /^total|subtotal|sum/i.test(groupText)) continue;
+
+        out.push({
+          group: groupText,
+          interestRate: col.rate >= 0 ? cells[col.rate] ?? '' : '',
+          principalBalance: col.principal >= 0 ? cells[col.principal] ?? '' : '',
+          unpaidInterest: col.unpaid >= 0 ? cells[col.unpaid] ?? '' : '',
+        });
+      }
+    };
+
+    document.querySelectorAll('table').forEach((table) => {
+      let headerRow = table.querySelector('thead tr');
+      let bodyRows = [...table.querySelectorAll('tbody tr')];
+      if (!headerRow && bodyRows.length > 0) {
+        headerRow = bodyRows[0];
+        bodyRows = bodyRows.slice(1);
+      }
+      if (headerRow && bodyRows.length) consumeTable(headerRow, bodyRows);
+    });
+
+    document.querySelectorAll('mat-table, table.mat-table, table.mat-mdc-table').forEach((table) => {
+      const hRow = table.querySelector('mat-header-row, tr[mat-header-row]');
+      const bRows = [...table.querySelectorAll('mat-row, tr[mat-row]')];
+      if (hRow && bRows.length) consumeTable(hRow, bRows);
+    });
+
+    return out;
+  });
+}
+
 async function scrapeNelnet() {
   const browser = await chromium.launch({ headless: false, slowMo: 500 });
   const page = await browser.newPage();
@@ -503,41 +680,43 @@ async function scrapeNelnet() {
       await screenshot(activePage, '05-post-mfa');
     }
 
-    // Scrape balance
-    console.log('Looking for loan balance...');
+    console.log('Opening My Loans...');
+    await activePage.waitForLoadState('load').catch(() => {});
+    await activePage.waitForTimeout(1500);
     await screenshot(activePage, '06-dashboard');
 
-    // Try common balance selectors — Nelnet may use any of these
-    const balanceSelectors = [
-      '[data-testid*="balance"]',
-      '[class*="balance"]',
-      '[class*="total"]',
-      'text=/outstanding balance/i',
-      'text=/current balance/i',
-      'text=/total balance/i',
-      'text=/amount due/i',
-    ];
+    const onMyLoans = await navigateToMyLoans(activePage);
+    if (!onMyLoans) {
+      console.warn(
+        'Could not open My Loans (URL, click, or DOM). Set MY_LOANS_URL in .env to the exact page from the address bar.',
+      );
+    }
+    await activePage.waitForLoadState('load').catch(() => {});
+    await activePage.waitForTimeout(2500);
+    await screenshot(activePage, '07-my-loans');
 
-    let balanceText = null;
-    for (const selector of balanceSelectors) {
-      const el = activePage.locator(selector).first();
-      const visible = await el.isVisible().catch(() => false);
-      if (visible) {
-        balanceText = await el.textContent();
-        console.log(`Found balance via selector "${selector}": ${balanceText?.trim()}`);
-        break;
+    let loanGroups = await scrapeLoanGroupsFromPage(activePage);
+    if (!loanGroups.length) {
+      for (const fr of activePage.frames()) {
+        if (fr === activePage.mainFrame()) continue;
+        loanGroups = await scrapeLoanGroupsFromPage(fr);
+        if (loanGroups.length) break;
       }
     }
 
-    if (!balanceText) {
-      // Fallback: dump all dollar amounts found on the page
-      console.log('\nCould not find a labelled balance element. Dollar amounts found on page:');
+    if (!loanGroups.length) {
+      console.log('\nNo loan table rows parsed. Dollar amounts on page (fallback):');
       const amounts = await activePage.locator('text=/\\$[\\d,]+\\.\\d{2}/').allTextContents();
-      amounts.forEach(a => console.log(' ', a.trim()));
-      console.log('\nCheck screenshots/ to see the dashboard and identify the right element.');
+      amounts.forEach((a) => console.log(' ', a.trim()));
+      console.log('Inspect screenshots/07-my-loans.png and we can tighten selectors.');
     } else {
-      console.log('\n--- Nelnet Balance ---');
-      console.log(balanceText.trim());
+      console.log('\n--- Loan groups ---');
+      for (const row of loanGroups) {
+        console.log(
+          `• ${row.group}\n  Interest rate: ${row.interestRate || '—'}\n  Principal balance: ${row.principalBalance || '—'}\n  Unpaid interest: ${row.unpaidInterest || '—'}`,
+        );
+      }
+      console.log('\nJSON:\n' + JSON.stringify(loanGroups, null, 2));
     }
 
   } catch (err) {
